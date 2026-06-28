@@ -1,4 +1,4 @@
 interface:
   display_name: "Ren'Py 游戏汉化"
-  short_description: "提取、翻译、润色并验证 Ren'Py 游戏的简体中文本地化。"
+  short_description: "提取、构建翻译单元、翻译、润色并验证 Ren'Py 游戏的简体中文本地化。"
   default_prompt: "Use $renpy-game-localizer to fully localize this Ren'Py game into Simplified Chinese and verify text layout."

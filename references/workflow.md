@@ -4,12 +4,13 @@
 
 1. Project discovery
 2. Translation setup
-3. Translation and revision passes
-4. LLM machine-translation cost control
-5. Layout repair
-6. Validation
-7. Handoff
-8. Agent-orchestrated pipeline
+3. Translation units and sample translation
+4. Translation and revision passes
+5. LLM machine-translation cost control
+6. Layout repair
+7. Validation
+8. Handoff
+9. Agent-orchestrated pipeline
 
 ## Agent-orchestrated pipeline
 
@@ -21,13 +22,15 @@ Recommended control loop:
 2. Decide whether to use `chinese` or a clean layer such as `schinese`. If legacy translation files, archived `tl/<language>` bytecode, mojibake, duplicate labels, or polluted `old` keys are present, prefer a clean layer and document why.
 3. Run `scripts/prepare_translation_layer.py` as the preparation gate. Let it detect the bundled Ren'Py command, optionally run official `translate <language>`, add CJK setup, and add expected menu/save/history UI strings. Prefer this over hand-built templates whenever the game runtime can generate translations.
 4. If official generation is unavailable or incomplete, decompile/extract archives before translating. Prefer established decompilers such as `unrpyc` for `screens.rpyc`/`gui.rpyc`; use `extract_rpyc_translations.py` as a fallback and verify branch traversal includes `block`, `else_`, `Menu.items[*][2]`, and `If.entries[*][1]`.
-5. Compare preparation results with `scan_renpy_project.py`: expected UI keys and discovered compiled-screen UI strings should be covered, `old` keys should remain source text, and empty target counts should be intentional template blanks rather than missed extraction.
-6. Create or update `localization_work/glossary.md` from detected characters, UI terms, recurring locations, and the user's name policy. If the user gives no policy, keep character names conservative and record it.
-7. Run the paid LLM sample pass before a full paid run. Inspect a mixed sample and, when possible, a script-heavy sample. Proceed only when placeholders, tags, tone, adult vocabulary, and name policy look acceptable.
-8. Run bulk translation with a resumable state file. For DeepSeek Flash, raise concurrency empirically after a successful sample. Prefer `--batch-size 40 --concurrency 128`; go higher only when the previous tier is stable and there are enough pending batches.
-9. Apply translations, then run validation gates: audit, font coverage if relevant, compile/lint, and a short launch probe that compares `traceback.txt` before and after launch.
-10. Use repair scripts only after a gate identifies a concrete defect. If a repair becomes routine, fold it into `prepare_translation_layer.py` or the audit gate instead of expanding the user-facing workflow.
-11. Handoff only after reporting translated scope, preparation method, scripts run, audit result, compile/launch result, token usage if available, and remaining visual or image-text risks.
+5. Compare preparation results with `scan_renpy_project.py`: expected UI keys and discovered compiled-screen UI strings should be covered, `old` keys should remain source text, empty target counts should be intentional template blanks rather than missed extraction, and `translation_mode_recommendation` should be understood before choosing official tl, strings, mixed, or inspection.
+6. Build translation units from the prepared language layer. Store the JSONL under `localization_work/` so provider state, review, resume, and apply decisions can reference stable unit ids.
+7. Create or update `localization_work/glossary.md` from detected characters, UI terms, recurring locations, and the user's name policy. If the user gives no policy, keep character names conservative and record it.
+8. Run a sample translation pass before a full paid run. Inspect a mixed sample and, when possible, a script-heavy sample. Proceed only when placeholders, tags, percent tokens, escape sequences, tone, adult vocabulary, and name policy look acceptable.
+9. Audit provider output against the unit `preserve_tokens`, apply only accepted translations, then run the Ren'Py translation audit.
+10. Run bulk translation with a resumable state file. DeepSeek Flash remains the current bundled bulk backend; raise concurrency empirically after a successful sample. Prefer `--batch-size 40 --concurrency 128`; go higher only when the previous tier is stable and there are enough pending batches.
+11. After apply, run validation gates: audit, font coverage if relevant, compile/lint, and a short launch probe that compares `traceback.txt` before and after launch.
+12. Use repair scripts only after a gate identifies a concrete defect. If a repair becomes routine, fold it into `prepare_translation_layer.py` or the audit gate instead of expanding the user-facing workflow.
+13. Handoff only after reporting translated scope, preparation method, unit counts, scripts run, audit result, compile/launch result, token usage if available, and remaining visual or image-text risks.
 
 Prefer scripts that emit machine-readable JSON or JSONL stage reports. When a script only prints text, the agent must still extract decision signals: counts, errors, warnings, changed files, provider/model, elapsed time, and retry/failure causes.
 
@@ -53,9 +56,11 @@ Useful stage decisions:
 
 - `scan`: choose language layer, archive strategy, runtime generation path, and whether a decompile/extract step is required.
 - `prepare`: decide whether official generation succeeded, whether UI/font setup was written, and whether helper repairs should be promoted into the preparation gate.
+- `build_units`: confirm target counts, pending counts, source/target pairing, and preserve-token coverage before provider translation.
 - `sample_translate`: approve bulk run, adjust glossary/prompt, lower/raise concurrency, or stop for user policy.
 - `bulk_translate`: resume, reduce concurrency on 429/timeouts, or proceed to apply when the state file covers the expected units.
-- `audit`: auto-fix known structural issues, route suspicious English to targeted repair, or inspect false positives.
+- `audit_apply`: verify provider output keeps unit tokens, apply only accepted targets, and keep rejected units pending.
+- `renpy_audit`: auto-fix known structural issues, route suspicious English to targeted repair, or inspect false positives.
 - `compile_launch`: distinguish compile-time syntax errors from runtime startup errors; always check `traceback.txt` after string-block edits.
 - `visual_qa`: fix fonts/styles first, then shorten translations only when the Chinese itself is verbose.
 
@@ -156,7 +161,27 @@ For LLM-assisted translation, read [llm-bulk-translation.md](llm-bulk-translatio
 
 Update the glossary and prompt before bulk translation. The glossary may remain in working notes unless the user asks for it as an artifact, but a reusable project should keep it as a checked-in or workspace artifact.
 
-## 3. Translation and revision passes
+## 3. Translation units and sample translation
+
+Build units after preparation and before paid or bulk translation:
+
+```powershell
+python <skill>/scripts/build_translation_units.py <project-root> --language chinese --output localization_work/translation_units_chinese.jsonl
+python <skill>/scripts/build_translation_units.py <project-root> --language chinese --pending-only --output localization_work/translation_units_pending_chinese.jsonl
+```
+
+Read [translation-units.md](translation-units.md) before designing provider state, review exports, or apply logic. Unit rows are the stable audit surface: each row points to one writable dialogue target line or one `new` string value, includes the source/target pair, and records `preserve_tokens`.
+
+Use the JSONL file to choose a representative sample before bulk work:
+
+- include dialogue, choices, UI strings, adult content, long lines, and lines with `[variables]`, `{tags}`, percent formats, and escapes;
+- keep provider responses keyed by `id`, not by line number alone;
+- reject or retry translations whose variables, tags, percent tokens, or escapes differ from the source;
+- keep rejected units pending instead of writing unsafe output.
+
+The current DeepSeek backend (`scripts/deepseek_renpy_tl_translate.py`) has its own resumable collector/apply flow. It remains usable for bulk translation, but new provider contracts and review/apply tooling should prefer the translation-unit JSONL boundary.
+
+## 4. Translation and revision passes
 
 ### Pass A: structural translation
 
@@ -203,7 +228,7 @@ rg -n "^\s*menu\b|events\.append|if .*score|if darkness|if pills" game -g "*.rpy
 
 Prioritize optional scenes because they are commonly skipped by linear proofreading.
 
-## 4. LLM machine-translation cost control
+## 5. LLM machine-translation cost control
 
 When using paid LLM or machine-translation APIs:
 
@@ -226,7 +251,7 @@ Recommended order:
 7. Optional full light polish with a cost-effective model.
 8. Premium-model pass only for selected difficult or important text.
 
-## 5. Layout repair
+## 6. Layout repair
 
 Prefer language-specific overrides in `game/tl/chinese/gui.rpy`.
 
@@ -304,7 +329,7 @@ python <skill>/scripts/audit_font_coverage.py <game-root> --language chinese --f
 
 The audit should report `missing=0`. If glyphs are still missing, switch fonts and rerun the audit. Keep large system fonts inside `game/` only when the user accepts the extra size.
 
-## 6. Validation
+## 7. Validation
 
 Run:
 
@@ -358,7 +383,7 @@ Visual QA sample:
 - chapter title and end title.
 - scenes containing rare Simplified Chinese characters reported by font coverage checks.
 
-## 7. Handoff
+## 8. Handoff
 
 Report:
 
@@ -370,4 +395,3 @@ Report:
 - whether visual launch testing was performed.
 
 Do not claim completion based only on file counts.
-

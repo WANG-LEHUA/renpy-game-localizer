@@ -21,6 +21,9 @@ NEW_EMPTY_RE = re.compile(r'^\s*new\s+""\s*(?:#.*)?$')
 SOURCE_COMMENT_RE = re.compile(r'^\s*#\s+(?:(?:[A-Za-z_]\w*)\s+)?"(?:\\.|[^"\\])*"')
 EMPTY_DIALOGUE_RE = re.compile(r'^\s*(?:[A-Za-z_]\w*\s+)?""\s*(?:#.*)?$')
 CHARACTER_RE = re.compile(r"^\s*define\s+([A-Za-z_]\w*)\s*=\s*Character\((.*)")
+RENPY_TRANSLATE_STRING_RE = re.compile(r"\brenpy\.translate_string\s*\(")
+SCREEN_SAY_RE = re.compile(r"^\s*screen\s+say\s*\(\s*who\s*,\s*what\s*\)\s*:")
+WHAT_TRANSLATE_STRING_RE = re.compile(r"^\s*(?:\$\s*)?what\s*=\s*renpy\.translate_string\s*\(\s*what\s*\)")
 MOJIBAKE_RE = re.compile(r"\ufffd|\u951f|\u8119|\u9239|\u95b3|\u68e3")
 CHINESE_RE = re.compile(r"[\u3400-\u9fff]")
 HIDDEN_TAG_RE = re.compile(r"^\{#[^{}]*\}$")
@@ -146,6 +149,17 @@ def rel(path: Path, root: Path) -> str:
         return path.as_posix()
 
 
+def is_tl_path(path: Path) -> bool:
+    return "/tl/" in path.as_posix().replace("\\", "/")
+
+
+def evidence_item(path: Path, root: Path, line: int, text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if len(stripped) > 180:
+        stripped = stripped[:177] + "..."
+    return {"file": rel(path, root), "line": line, "text": stripped}
+
+
 def find_game_dir(root: Path) -> Path:
     if (root / "game").is_dir():
         return root / "game"
@@ -227,6 +241,91 @@ def discover_rpyc_ui_string_keys(paths: list[Path]) -> list[str]:
                 if key and key not in IGNORED_DISCOVERED_UI_KEYS:
                     keys.add(key)
     return sorted(keys)
+
+
+def scan_custom_translation_patterns(rpy_files: list[Path], root: Path) -> dict[str, Any]:
+    calls: list[dict[str, Any]] = []
+    screen_say: list[dict[str, Any]] = []
+    what_wrappers: list[dict[str, Any]] = []
+    call_count = 0
+    screen_say_count = 0
+    what_wrapper_count = 0
+
+    for path in rpy_files:
+        if is_tl_path(path):
+            continue
+        lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        for number, line in enumerate(lines, 1):
+            if RENPY_TRANSLATE_STRING_RE.search(line):
+                call_count += 1
+                if len(calls) < 20:
+                    calls.append(evidence_item(path, root, number, line))
+            if SCREEN_SAY_RE.match(line):
+                screen_say_count += 1
+                if len(screen_say) < 20:
+                    screen_say.append(evidence_item(path, root, number, line))
+            if WHAT_TRANSLATE_STRING_RE.match(line):
+                what_wrapper_count += 1
+                if len(what_wrappers) < 20:
+                    what_wrappers.append(evidence_item(path, root, number, line))
+
+    return {
+        "summary": {
+            "renpy_translate_string_calls": call_count,
+            "screen_say_definitions": screen_say_count,
+            "what_translate_string_wrappers": what_wrapper_count,
+        },
+        "renpy_translate_string_calls": calls,
+        "screen_say_definitions": screen_say,
+        "what_translate_string_wrappers": what_wrappers,
+    }
+
+
+def build_translation_mode_recommendation(
+    custom_detection: dict[str, Any], language_reports: list[dict[str, Any]]
+) -> dict[str, Any]:
+    summary = custom_detection.get("summary", {})
+    call_count = int(summary.get("renpy_translate_string_calls", 0))
+    screen_say_count = int(summary.get("screen_say_definitions", 0))
+    wrapper_count = int(summary.get("what_translate_string_wrappers", 0))
+    has_tl_blocks = any(
+        item.get("exists") and (item.get("translate_blocks", 0) or item.get("string_old_lines", 0))
+        for item in language_reports
+    )
+    evidence: list[str] = []
+
+    if screen_say_count:
+        evidence.append(f"screen say(who, what) definitions: {screen_say_count}")
+    if wrapper_count:
+        evidence.append(f"what = renpy.translate_string(what) wrappers: {wrapper_count}")
+    if call_count:
+        evidence.append(f"renpy.translate_string calls: {call_count}")
+    if has_tl_blocks:
+        evidence.append("existing official tl blocks/strings are present")
+
+    if wrapper_count and has_tl_blocks:
+        return {
+            "mode": "mixed",
+            "reason": "Custom say text is passed through renpy.translate_string while official tl blocks or strings already exist.",
+            "evidence": evidence,
+        }
+    if wrapper_count:
+        return {
+            "mode": "strings",
+            "reason": "The say screen translates displayed what text through renpy.translate_string; prioritize translate strings coverage and inspect dialogue generation.",
+            "evidence": evidence,
+        }
+    if call_count:
+        return {
+            "mode": "inspect_required",
+            "reason": "renpy.translate_string is used outside the recognized say-screen wrapper; inspect call sites before choosing strings-only or mixed translation.",
+            "evidence": evidence,
+        }
+    return {
+        "mode": "official_tl",
+        "reason": "No renpy.translate_string-based custom say path was detected; use Ren'Py official translate blocks plus strings.",
+        "evidence": evidence or ["no custom translation-string signals detected"],
+    }
 
 
 def inspect_language(tl_dir: Path, language: str, root: Path, discovered_ui_keys: list[str]) -> dict[str, Any]:
@@ -351,6 +450,10 @@ def scan(root: Path, languages: list[str]) -> dict[str, Any]:
         inspect_language(tl_dir, language, project_root, discovered_ui_keys)
         for language in selected_languages
     ]
+    custom_translation_detection = scan_custom_translation_patterns(rpy_files, project_root)
+    translation_mode_recommendation = build_translation_mode_recommendation(
+        custom_translation_detection, language_reports
+    )
 
     signals: list[str] = []
     recommended_actions: list[dict[str, Any]] = []
@@ -416,6 +519,8 @@ def scan(root: Path, languages: list[str]) -> dict[str, Any]:
         },
         "tl_languages": tl_languages,
         "language_reports": language_reports,
+        "custom_translation_detection": custom_translation_detection,
+        "translation_mode_recommendation": translation_mode_recommendation,
         "logs": {path.name: file_stat(path, project_root) for path in logs if path.exists()},
         "signals": sorted(set(signals)),
         "recommended_actions": recommended_actions,
